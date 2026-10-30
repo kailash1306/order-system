@@ -42,7 +42,7 @@ pipeline {
 
                     & $env:DOCKER_EXE --version
                     if ($LASTEXITCODE -ne 0) {
-                        throw "Docker check failed."
+                        throw "Docker version check failed."
                     }
 
                     & $env:KUBECTL_EXE --kubeconfig $env:KUBE_CONFIG get nodes
@@ -89,7 +89,6 @@ pipeline {
                         Write-Host "Credential ID resolved: PASS"
                         Write-Host "Username exact match: PASS"
                         Write-Host "Token present: PASS"
-                        Write-Host "Token length: $($env:DH_TOKEN.Length)"
                     '''
                 }
             }
@@ -106,28 +105,63 @@ pipeline {
                 ]) {
                     powershell '''
                         $ErrorActionPreference = "Stop"
+                        $token = $env:DH_TOKEN.Trim()
+                        $docker = $env:DOCKER_EXE
 
                         $configDir = Join-Path $env:WORKSPACE "docker-auth-test"
                         New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+
                         $env:DOCKER_CONFIG = $configDir
 
-                        try {
-                            $env:DH_TOKEN |
-                                & $env:DOCKER_EXE login `
-                                    --username $env:DH_USER `
-                                    --password-stdin
+                        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+                        $startInfo.FileName = $docker
+                        $startInfo.Arguments = 'login --username "' + $env:DH_USER + '" --password-stdin'
+                        $startInfo.UseShellExecute = $false
+                        $startInfo.RedirectStandardInput = $true
+                        $startInfo.RedirectStandardOutput = $true
+                        $startInfo.RedirectStandardError = $true
+                        $startInfo.CreateNoWindow = $true
 
-                            if ($LASTEXITCODE -ne 0) {
-                                throw "Docker Hub login failed."
+                        $process = New-Object System.Diagnostics.Process
+                        $process.StartInfo = $startInfo
+
+                        try {
+                            [void]$process.Start()
+                            $process.StandardInput.Write($token)
+                            $process.StandardInput.Close()
+
+                            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+                            $stderrTask = $process.StandardError.ReadToEndAsync()
+
+                            $process.WaitForExit()
+
+                            $stdout = $stdoutTask.Result
+                            $stderr = $stderrTask.Result
+
+                            if ($process.ExitCode -ne 0) {
+                                Write-Host "Docker login failed. Exit code: $($process.ExitCode)"
+                                if ($stderr) {
+                                    Write-Host $stderr
+                                }
+                                throw "Docker Hub authentication failed."
                             }
 
                             Write-Host "Docker Hub login: PASS"
+                            if ($stdout) {
+                                Write-Host $stdout
+                            }
                         }
                         finally {
-                            & $env:DOCKER_EXE logout 2>$null | Out-Null
+                            if ($process -and -not $process.HasExited) {
+                                $process.Kill()
+                            }
+
+                            $process.Dispose()
+
+                            & $docker logout 2>$null | Out-Null
                             Remove-Item Env:DOCKER_CONFIG -ErrorAction SilentlyContinue
-                            Remove-Item -Recurse -Force $configDir `
-                                -ErrorAction SilentlyContinue
+                            Remove-Item -Recurse -Force $configDir -ErrorAction SilentlyContinue
+                            Remove-Variable token -ErrorAction SilentlyContinue
                         }
                     '''
                 }
@@ -145,22 +179,49 @@ pipeline {
                 ]) {
                     powershell '''
                         $ErrorActionPreference = "Stop"
+                        $token = $env:DH_TOKEN.Trim()
+                        $docker = $env:DOCKER_EXE
 
                         $configDir = Join-Path $env:WORKSPACE "docker-push-auth"
                         New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+
                         $env:DOCKER_CONFIG = $configDir
 
-                        try {
-                            $env:DH_TOKEN |
-                                & $env:DOCKER_EXE login `
-                                    --username $env:DH_USER `
-                                    --password-stdin
+                        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+                        $startInfo.FileName = $docker
+                        $startInfo.Arguments = 'login --username "' + $env:DH_USER + '" --password-stdin'
+                        $startInfo.UseShellExecute = $false
+                        $startInfo.RedirectStandardInput = $true
+                        $startInfo.RedirectStandardOutput = $true
+                        $startInfo.RedirectStandardError = $true
+                        $startInfo.CreateNoWindow = $true
 
-                            if ($LASTEXITCODE -ne 0) {
+                        $process = New-Object System.Diagnostics.Process
+                        $process.StartInfo = $startInfo
+
+                        try {
+                            [void]$process.Start()
+                            $process.StandardInput.Write($token)
+                            $process.StandardInput.Close()
+
+                            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+                            $stderrTask = $process.StandardError.ReadToEndAsync()
+
+                            $process.WaitForExit()
+
+                            $stdout = $stdoutTask.Result
+                            $stderr = $stderrTask.Result
+
+                            if ($process.ExitCode -ne 0) {
+                                if ($stderr) {
+                                    Write-Host $stderr
+                                }
                                 throw "Docker Hub login before push failed."
                             }
 
-                            & $env:DOCKER_EXE push $env:IMAGE_NAME
+                            Write-Host "Docker Hub login before push: PASS"
+
+                            & $docker push $env:IMAGE_NAME
                             if ($LASTEXITCODE -ne 0) {
                                 throw "Docker image push failed."
                             }
@@ -168,10 +229,16 @@ pipeline {
                             Write-Host "Docker image push successful."
                         }
                         finally {
-                            & $env:DOCKER_EXE logout 2>$null | Out-Null
+                            if ($process -and -not $process.HasExited) {
+                                $process.Kill()
+                            }
+
+                            $process.Dispose()
+
+                            & $docker logout 2>$null | Out-Null
                             Remove-Item Env:DOCKER_CONFIG -ErrorAction SilentlyContinue
-                            Remove-Item -Recurse -Force $configDir `
-                                -ErrorAction SilentlyContinue
+                            Remove-Item -Recurse -Force $configDir -ErrorAction SilentlyContinue
+                            Remove-Variable token -ErrorAction SilentlyContinue
                         }
                     '''
                 }
@@ -189,19 +256,12 @@ pipeline {
                         throw "Manifest k8s/v1.yaml not found."
                     }
 
-                    & $env:KUBECTL_EXE `
-                        --kubeconfig $env:KUBE_CONFIG `
-                        apply -f $manifest
-
+                    & $env:KUBECTL_EXE --kubeconfig $env:KUBE_CONFIG apply -f $manifest
                     if ($LASTEXITCODE -ne 0) {
                         throw "Kubernetes apply failed."
                     }
 
-                    & $env:KUBECTL_EXE `
-                        --kubeconfig $env:KUBE_CONFIG `
-                        rollout status deployment/order-v1 `
-                        --timeout=180s
-
+                    & $env:KUBECTL_EXE --kubeconfig $env:KUBE_CONFIG rollout status deployment/order-v1 --timeout=180s
                     if ($LASTEXITCODE -ne 0) {
                         throw "Deployment rollout failed."
                     }
@@ -216,28 +276,19 @@ pipeline {
                 powershell '''
                     $ErrorActionPreference = "Stop"
 
-                    & $env:KUBECTL_EXE `
-                        --kubeconfig $env:KUBE_CONFIG `
-                        get deployment order-v1
-
+                    & $env:KUBECTL_EXE --kubeconfig $env:KUBE_CONFIG get deployment order-v1
                     if ($LASTEXITCODE -ne 0) {
-                        throw "Could not verify deployment."
+                        throw "Deployment verification failed."
                     }
 
-                    & $env:KUBECTL_EXE `
-                        --kubeconfig $env:KUBE_CONFIG `
-                        get pods
-
+                    & $env:KUBECTL_EXE --kubeconfig $env:KUBE_CONFIG get pods
                     if ($LASTEXITCODE -ne 0) {
-                        throw "Could not verify pods."
+                        throw "Pod verification failed."
                     }
 
-                    & $env:KUBECTL_EXE `
-                        --kubeconfig $env:KUBE_CONFIG `
-                        get services
-
+                    & $env:KUBECTL_EXE --kubeconfig $env:KUBE_CONFIG get services
                     if ($LASTEXITCODE -ne 0) {
-                        throw "Could not verify services."
+                        throw "Service verification failed."
                     }
 
                     Write-Host "Deployment verification complete."
