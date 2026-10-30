@@ -1,53 +1,74 @@
-
 pipeline {
     agent any
 
     options {
+        skipDefaultCheckout(true)
         timestamps()
     }
 
     environment {
         DOCKER_EXE = 'C:\\Users\\tkail\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\docker.exe'
         KUBECTL_EXE = 'C:\\Users\\tkail\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\kubectl.exe'
-        DOCKER_IMAGE = '24mis0218/order-system:v1'
-        KUBECONFIG = 'C:\\jenkins-kube\\config'
+
+        IMAGE_NAME = '24mis0218/order-system:v1'
+        KUBE_CONFIG = 'C:\\jenkins-kube\\config'
     }
 
     stages {
+
         stage('Checkout') {
             steps {
-                echo 'Source code checked out from GitHub.'
-                bat 'git log -1 --oneline'
+                git branch: 'main',
+                    url: 'https://github.com/kailash1306/order-system.git'
             }
         }
 
         stage('Verify Tools') {
             steps {
-                bat '''
-                    @echo off
-                    "%DOCKER_EXE%" --version
-                    if errorlevel 1 exit /b 1
+                powershell '''
+                    $ErrorActionPreference = "Stop"
 
-                    "%KUBECTL_EXE%" version --client
-                    if errorlevel 1 exit /b 1
+                    if (-not (Test-Path $env:DOCKER_EXE)) {
+                        throw "Docker executable not found: $env:DOCKER_EXE"
+                    }
 
-                    "%KUBECTL_EXE%" get nodes
-                    if errorlevel 1 exit /b 1
+                    if (-not (Test-Path $env:KUBECTL_EXE)) {
+                        throw "kubectl executable not found: $env:KUBECTL_EXE"
+                    }
+
+                    if (-not (Test-Path $env:KUBE_CONFIG)) {
+                        throw "Kubeconfig not found: $env:KUBE_CONFIG"
+                    }
+
+                    & $env:DOCKER_EXE --version
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Docker version check failed."
+                    }
+
+                    & $env:KUBECTL_EXE --kubeconfig $env:KUBE_CONFIG get nodes
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Cannot access the Kubernetes cluster."
+                    }
                 '''
             }
         }
 
         stage('Build Docker Image') {
             steps {
-                bat '''
-                    @echo off
-                    "%DOCKER_EXE%" build -t "%DOCKER_IMAGE%" .
-                    if errorlevel 1 exit /b 1
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+
+                    & $env:DOCKER_EXE build -t $env:IMAGE_NAME .
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Docker image build failed."
+                    }
+
+                    Write-Host "Docker image build successful."
                 '''
             }
         }
 
-        stage('Diagnose Docker Hub Credentials') {
+        stage('Test Docker Hub Login') {
             steps {
                 withCredentials([
                     usernamePassword(
@@ -57,17 +78,32 @@ pipeline {
                     )
                 ]) {
                     powershell '''
-                        if ($env:DH_USER -cne "24mis0218") {
-                            throw "Unexpected Docker Hub username."
-                        }
+                        $ErrorActionPreference = "Stop"
 
-                        if ([string]::IsNullOrWhiteSpace($env:DH_TOKEN)) {
-                            throw "Jenkins retrieved an empty token."
-                        }
+                        $configDir = Join-Path $env:WORKSPACE "docker-auth-test"
+                        New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 
-                        Write-Host "Username check: PASS"
-                        Write-Host "Token presence check: PASS"
-                        Write-Host "Token length: $($env:DH_TOKEN.Length)"
+                        $env:DOCKER_CONFIG = $configDir
+
+                        try {
+                            $env:DH_TOKEN |
+                                & $env:DOCKER_EXE login `
+                                    --username $env:DH_USER `
+                                    --password-stdin
+
+                            if ($LASTEXITCODE -ne 0) {
+                                throw "Docker Hub login failed. Check the Jenkins credential."
+                            }
+
+                            Write-Host "Docker Hub login using Jenkins credentials: PASS"
+                        }
+                        finally {
+                            & $env:DOCKER_EXE logout 2>$null | Out-Null
+
+                            Remove-Item Env:DOCKER_CONFIG -ErrorAction SilentlyContinue
+                            Remove-Item -Recurse -Force $configDir `
+                                -ErrorAction SilentlyContinue
+                        }
                     '''
                 }
             }
@@ -84,48 +120,105 @@ pipeline {
                 ]) {
                     powershell '''
                         $ErrorActionPreference = "Stop"
-                        $docker = $env:DOCKER_EXE
 
-                        $env:DH_TOKEN |
-                            & $docker login `
-                                --username $env:DH_USER `
-                                --password-stdin
+                        $configDir = Join-Path $env:WORKSPACE "docker-push-auth"
+                        New-Item -ItemType Directory -Force -Path $configDir | Out-Null
 
-                        if ($LASTEXITCODE -ne 0) {
-                            throw "Docker Hub login failed."
+                        $env:DOCKER_CONFIG = $configDir
+
+                        try {
+                            $env:DH_TOKEN |
+                                & $env:DOCKER_EXE login `
+                                    --username $env:DH_USER `
+                                    --password-stdin
+
+                            if ($LASTEXITCODE -ne 0) {
+                                throw "Docker Hub login failed before push."
+                            }
+
+                            & $env:DOCKER_EXE push $env:IMAGE_NAME
+                            if ($LASTEXITCODE -ne 0) {
+                                throw "Docker image push failed."
+                            }
+
+                            Write-Host "Docker image pushed successfully."
                         }
+                        finally {
+                            & $env:DOCKER_EXE logout 2>$null | Out-Null
 
-                        & $docker push $env:DOCKER_IMAGE
-
-                        if ($LASTEXITCODE -ne 0) {
-                            throw "Docker Hub image push failed."
+                            Remove-Item Env:DOCKER_CONFIG -ErrorAction SilentlyContinue
+                            Remove-Item -Recurse -Force $configDir `
+                                -ErrorAction SilentlyContinue
                         }
-
-                        & $docker logout
                     '''
                 }
             }
         }
 
-        stage('Deploy V1 to Kubernetes') {
+        stage('Deploy to Kubernetes') {
             steps {
-                bat '''
-                    @echo off
+                powershell '''
+                    $ErrorActionPreference = "Stop"
 
-                    "%KUBECTL_EXE%" apply -f k8s/v1.yaml
-                    if errorlevel 1 exit /b 1
+                    $manifest = Join-Path $env:WORKSPACE "k8s\\v1.yaml"
 
-                    "%KUBECTL_EXE%" set image deployment/order-v1 order-system="%DOCKER_IMAGE%"
-                    if errorlevel 1 exit /b 1
+                    if (-not (Test-Path $manifest)) {
+                        throw "Kubernetes manifest not found: $manifest"
+                    }
 
-                    "%KUBECTL_EXE%" rollout status deployment/order-v1 --timeout=120s
-                    if errorlevel 1 exit /b 1
+                    & $env:KUBECTL_EXE `
+                        --kubeconfig $env:KUBE_CONFIG `
+                        apply -f $manifest
 
-                    "%KUBECTL_EXE%" get deployments
-                    if errorlevel 1 exit /b 1
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Kubernetes deployment failed."
+                    }
 
-                    "%KUBECTL_EXE%" get services
-                    if errorlevel 1 exit /b 1
+                    & $env:KUBECTL_EXE `
+                        --kubeconfig $env:KUBE_CONFIG `
+                        rollout status deployment/order-v1 `
+                        --timeout=180s
+
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Deployment rollout did not complete successfully."
+                    }
+
+                    Write-Host "Kubernetes deployment successful."
+                '''
+            }
+        }
+
+        stage('Verify Deployment') {
+            steps {
+                powershell '''
+                    $ErrorActionPreference = "Stop"
+
+                    Write-Host "Deployment status:"
+                    & $env:KUBECTL_EXE `
+                        --kubeconfig $env:KUBE_CONFIG `
+                        get deployment order-v1
+
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Failed to retrieve deployment status."
+                    }
+
+                    Write-Host "Pods:"
+                    & $env:KUBECTL_EXE `
+                        --kubeconfig $env:KUBE_CONFIG `
+                        get pods
+
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Failed to retrieve pod status."
+                    }
+
+                    Write-Host "Services:"
+                    & $env:KUBECTL_EXE `
+                        --kubeconfig $env:KUBE_CONFIG `
+                        get services
+
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Failed to retrieve services."
+                    }
                 '''
             }
         }
@@ -133,15 +226,15 @@ pipeline {
 
     post {
         success {
-            echo 'V1 pipeline succeeded: Docker image pushed and Kubernetes rollout verified.'
+            echo 'V1 pipeline completed successfully: build, push, and deployment verified.'
         }
 
         failure {
-            echo 'V1 pipeline failed. Check the first failing stage in Console Output.'
+            echo 'V1 pipeline failed. Check the first failed stage in the Jenkins console output.'
         }
 
         always {
-            echo 'V1 CI/CD pipeline finished.'
+            echo 'V1 pipeline execution finished.'
         }
     }
 }
