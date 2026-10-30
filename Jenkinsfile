@@ -3,19 +3,21 @@ pipeline {
     agent any
 
     options {
-        skipDefaultCheckout(true)
         timestamps()
+        disableConcurrentBuilds()
     }
 
     environment {
         DOCKER_EXE = 'C:\\Users\\tkail\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\docker.exe'
         KUBECTL_EXE = 'C:\\Users\\tkail\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\kubectl.exe'
-        KUBE_CONFIG = 'C:\\jenkins-kube\\config'
+        KUBECONFIG = 'C:\\jenkins-kube\\config'
+
         IMAGE_NAME = '24mis0218/order-system:v1'
+        DEPLOYMENT_NAME = 'order-v1'
+        CONTAINER_NAME = 'order-system'
     }
 
     stages {
-
         stage('Checkout') {
             steps {
                 git branch: 'main',
@@ -29,25 +31,25 @@ pipeline {
                     $ErrorActionPreference = "Stop"
 
                     if (-not (Test-Path $env:DOCKER_EXE)) {
-                        throw "Docker executable not found."
+                        throw "Docker executable not found: $env:DOCKER_EXE"
                     }
 
                     if (-not (Test-Path $env:KUBECTL_EXE)) {
-                        throw "kubectl executable not found."
+                        throw "kubectl executable not found: $env:KUBECTL_EXE"
                     }
 
-                    if (-not (Test-Path $env:KUBE_CONFIG)) {
-                        throw "Kubeconfig not found."
+                    if (-not (Test-Path $env:KUBECONFIG)) {
+                        throw "Kubeconfig not found: $env:KUBECONFIG"
                     }
 
                     & $env:DOCKER_EXE --version
                     if ($LASTEXITCODE -ne 0) {
-                        throw "Docker version check failed."
+                        throw "Docker is not working."
                     }
 
-                    & $env:KUBECTL_EXE --kubeconfig $env:KUBE_CONFIG get nodes
+                    & $env:KUBECTL_EXE --kubeconfig $env:KUBECONFIG get nodes
                     if ($LASTEXITCODE -ne 0) {
-                        throw "Kubernetes connection failed."
+                        throw "Cannot connect to Kubernetes."
                     }
                 '''
             }
@@ -58,43 +60,25 @@ pipeline {
                 powershell '''
                     $ErrorActionPreference = "Stop"
 
+                    if (-not (Test-Path "Dockerfile")) {
+                        throw "Dockerfile is missing from the repository."
+                    }
+
                     & $env:DOCKER_EXE build -t $env:IMAGE_NAME .
                     if ($LASTEXITCODE -ne 0) {
                         throw "Docker image build failed."
                     }
 
                     Write-Host "Docker image build successful."
+                    & $env:DOCKER_EXE image inspect $env:IMAGE_NAME
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "Built image could not be inspected."
+                    }
                 '''
             }
         }
 
-        stage('Diagnose Docker Hub Credential') {
-            steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'dockerhub-creds',
-                        usernameVariable: 'DH_USER',
-                        passwordVariable: 'DH_TOKEN'
-                    )
-                ]) {
-                    powershell '''
-                        if ($env:DH_USER -cne "24mis0218") {
-                            throw "Unexpected Docker Hub username."
-                        }
-
-                        if ([string]::IsNullOrWhiteSpace($env:DH_TOKEN)) {
-                            throw "Docker Hub token is empty."
-                        }
-
-                        Write-Host "Credential ID resolved: PASS"
-                        Write-Host "Username exact match: PASS"
-                        Write-Host "Token present: PASS"
-                    '''
-                }
-            }
-        }
-
-        stage('Test Docker Hub Login') {
+        stage('Docker Hub Login and Push') {
             steps {
                 withCredentials([
                     usernamePassword(
@@ -105,140 +89,93 @@ pipeline {
                 ]) {
                     powershell '''
                         $ErrorActionPreference = "Stop"
-                        $token = $env:DH_TOKEN.Trim()
+
                         $docker = $env:DOCKER_EXE
+                        $username = $env:DH_USER
+                        $token = $env:DH_TOKEN
 
-                        $configDir = Join-Path $env:WORKSPACE "docker-auth-test"
-                        New-Item -ItemType Directory -Force -Path $configDir | Out-Null
+                        if ($username -ne "24mis0218") {
+                            throw "Docker Hub username does not match the expected account."
+                        }
 
+                        if ([string]::IsNullOrWhiteSpace($token)) {
+                            throw "Docker Hub token is empty. Check Jenkins credentials."
+                        }
+
+                        # Use a clean, isolated Docker configuration.
+                        $configDir = Join-Path $env:WORKSPACE "docker-auth-push"
+
+                        if (Test-Path $configDir) {
+                            Remove-Item -Recurse -Force $configDir
+                        }
+
+                        New-Item -ItemType Directory -Path $configDir | Out-Null
                         $env:DOCKER_CONFIG = $configDir
 
-                        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-                        $startInfo.FileName = $docker
-                        $startInfo.Arguments = 'login --username "' + $env:DH_USER + '" --password-stdin'
-                        $startInfo.UseShellExecute = $false
-                        $startInfo.RedirectStandardInput = $true
-                        $startInfo.RedirectStandardOutput = $true
-                        $startInfo.RedirectStandardError = $true
-                        $startInfo.CreateNoWindow = $true
-
-                        $process = New-Object System.Diagnostics.Process
-                        $process.StartInfo = $startInfo
-
                         try {
+                            # Send the PAT through stdin, never as a command-line argument.
+                            $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+                            $startInfo.FileName = $docker
+                            $startInfo.Arguments = "login --username $username --password-stdin"
+                            $startInfo.UseShellExecute = $false
+                            $startInfo.CreateNoWindow = $true
+                            $startInfo.RedirectStandardInput = $true
+                            $startInfo.RedirectStandardOutput = $true
+                            $startInfo.RedirectStandardError = $true
+
+                            $process = New-Object System.Diagnostics.Process
+                            $process.StartInfo = $startInfo
+
                             [void]$process.Start()
-                            $process.StandardInput.Write($token)
-                            $process.StandardInput.Close()
 
                             $stdoutTask = $process.StandardOutput.ReadToEndAsync()
                             $stderrTask = $process.StandardError.ReadToEndAsync()
+
+                            $process.StandardInput.WriteLine($token)
+                            $process.StandardInput.Close()
 
                             $process.WaitForExit()
 
                             $stdout = $stdoutTask.Result
                             $stderr = $stderrTask.Result
-
-                            if ($process.ExitCode -ne 0) {
-                                Write-Host "Docker login failed. Exit code: $($process.ExitCode)"
-                                if ($stderr) {
-                                    Write-Host $stderr
-                                }
-                                throw "Docker Hub authentication failed."
-                            }
-
-                            Write-Host "Docker Hub login: PASS"
-                            if ($stdout) {
-                                Write-Host $stdout
-                            }
-                        }
-                        finally {
-                            if ($process -and -not $process.HasExited) {
-                                $process.Kill()
-                            }
+                            $loginCode = $process.ExitCode
 
                             $process.Dispose()
 
-                            & $docker logout 2>$null | Out-Null
-                            Remove-Item Env:DOCKER_CONFIG -ErrorAction SilentlyContinue
-                            Remove-Item -Recurse -Force $configDir -ErrorAction SilentlyContinue
-                            Remove-Variable token -ErrorAction SilentlyContinue
-                        }
-                    '''
-                }
-            }
-        }
+                            if ($loginCode -ne 0) {
+                                Write-Host "Docker Hub login failed. Exit code: $loginCode"
 
-        stage('Push Docker Image') {
-            steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'dockerhub-creds',
-                        usernameVariable: 'DH_USER',
-                        passwordVariable: 'DH_TOKEN'
-                    )
-                ]) {
-                    powershell '''
-                        $ErrorActionPreference = "Stop"
-                        $token = $env:DH_TOKEN.Trim()
-                        $docker = $env:DOCKER_EXE
+                                if (-not [string]::IsNullOrWhiteSpace($stdout)) {
+                                    Write-Host $stdout
+                                }
 
-                        $configDir = Join-Path $env:WORKSPACE "docker-push-auth"
-                        New-Item -ItemType Directory -Force -Path $configDir | Out-Null
-
-                        $env:DOCKER_CONFIG = $configDir
-
-                        $startInfo = New-Object System.Diagnostics.ProcessStartInfo
-                        $startInfo.FileName = $docker
-                        $startInfo.Arguments = 'login --username "' + $env:DH_USER + '" --password-stdin'
-                        $startInfo.UseShellExecute = $false
-                        $startInfo.RedirectStandardInput = $true
-                        $startInfo.RedirectStandardOutput = $true
-                        $startInfo.RedirectStandardError = $true
-                        $startInfo.CreateNoWindow = $true
-
-                        $process = New-Object System.Diagnostics.Process
-                        $process.StartInfo = $startInfo
-
-                        try {
-                            [void]$process.Start()
-                            $process.StandardInput.Write($token)
-                            $process.StandardInput.Close()
-
-                            $stdoutTask = $process.StandardOutput.ReadToEndAsync()
-                            $stderrTask = $process.StandardError.ReadToEndAsync()
-
-                            $process.WaitForExit()
-
-                            $stdout = $stdoutTask.Result
-                            $stderr = $stderrTask.Result
-
-                            if ($process.ExitCode -ne 0) {
-                                if ($stderr) {
+                                if (-not [string]::IsNullOrWhiteSpace($stderr)) {
                                     Write-Host $stderr
                                 }
-                                throw "Docker Hub login before push failed."
+
+                                throw "Docker Hub authentication failed. Verify the PAT and Jenkins credential."
                             }
 
-                            Write-Host "Docker Hub login before push: PASS"
+                            Write-Host "Docker Hub login successful."
 
+                            # Push only after successful authentication.
                             & $docker push $env:IMAGE_NAME
+
                             if ($LASTEXITCODE -ne 0) {
                                 throw "Docker image push failed."
                             }
 
-                            Write-Host "Docker image push successful."
+                            Write-Host "Docker image pushed successfully."
                         }
                         finally {
-                            if ($process -and -not $process.HasExited) {
-                                $process.Kill()
-                            }
-
-                            $process.Dispose()
-
+                            # Remove temporary authentication data.
                             & $docker logout 2>$null | Out-Null
+
                             Remove-Item Env:DOCKER_CONFIG -ErrorAction SilentlyContinue
-                            Remove-Item -Recurse -Force $configDir -ErrorAction SilentlyContinue
-                            Remove-Variable token -ErrorAction SilentlyContinue
+
+                            if (Test-Path $configDir) {
+                                Remove-Item -Recurse -Force $configDir
+                            }
                         }
                     '''
                 }
@@ -250,23 +187,21 @@ pipeline {
                 powershell '''
                     $ErrorActionPreference = "Stop"
 
-                    $manifest = Join-Path $env:WORKSPACE "k8s\\v1.yaml"
-
-                    if (-not (Test-Path $manifest)) {
-                        throw "Manifest k8s/v1.yaml not found."
+                    if (-not (Test-Path "k8s\\v1.yaml")) {
+                        throw "Kubernetes manifest k8s\\v1.yaml was not found."
                     }
 
-                    & $env:KUBECTL_EXE --kubeconfig $env:KUBE_CONFIG apply -f $manifest
+                    & $env:KUBECTL_EXE --kubeconfig $env:KUBECONFIG apply -f "k8s\\v1.yaml"
+
                     if ($LASTEXITCODE -ne 0) {
-                        throw "Kubernetes apply failed."
+                        throw "Kubernetes deployment apply failed."
                     }
 
-                    & $env:KUBECTL_EXE --kubeconfig $env:KUBE_CONFIG rollout status deployment/order-v1 --timeout=180s
+                    & $env:KUBECTL_EXE --kubeconfig $env:KUBECONFIG rollout status "deployment/$env:DEPLOYMENT_NAME" --timeout=180s
+
                     if ($LASTEXITCODE -ne 0) {
                         throw "Deployment rollout failed."
                     }
-
-                    Write-Host "Kubernetes deployment successful."
                 '''
             }
         }
@@ -276,22 +211,22 @@ pipeline {
                 powershell '''
                     $ErrorActionPreference = "Stop"
 
-                    & $env:KUBECTL_EXE --kubeconfig $env:KUBE_CONFIG get deployment order-v1
+                    & $env:KUBECTL_EXE --kubeconfig $env:KUBECONFIG get deployment $env:DEPLOYMENT_NAME
                     if ($LASTEXITCODE -ne 0) {
-                        throw "Deployment verification failed."
+                        throw "Could not verify deployment."
                     }
 
-                    & $env:KUBECTL_EXE --kubeconfig $env:KUBE_CONFIG get pods
+                    & $env:KUBECTL_EXE --kubeconfig $env:KUBECONFIG get pods -o wide
                     if ($LASTEXITCODE -ne 0) {
-                        throw "Pod verification failed."
+                        throw "Could not list Kubernetes pods."
                     }
 
-                    & $env:KUBECTL_EXE --kubeconfig $env:KUBE_CONFIG get services
+                    & $env:KUBECTL_EXE --kubeconfig $env:KUBECONFIG get services
                     if ($LASTEXITCODE -ne 0) {
-                        throw "Service verification failed."
+                        throw "Could not list Kubernetes services."
                     }
 
-                    Write-Host "Deployment verification complete."
+                    Write-Host "V1 deployment verification completed."
                 '''
             }
         }
@@ -299,11 +234,11 @@ pipeline {
 
     post {
         success {
-            echo 'SUCCESS: V1 image built, pushed, and deployment verified.'
+            echo 'SUCCESS: V1 pipeline completed, image pushed, and Kubernetes deployment verified.'
         }
 
         failure {
-            echo 'FAILURE: Check the first failed stage in Console Output.'
+            echo 'FAILURE: Open Console Output and inspect the first failed stage.'
         }
 
         always {
