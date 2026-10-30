@@ -34,22 +34,27 @@ pipeline {
         }
 
         stage('Push Docker Image') {
-            steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'dockerhub-creds',
-                        usernameVariable: 'DH_USER',
-                        passwordVariable: 'DH_TOKEN'
-                    )
-                ]) {
-                    bat '''
-                        echo %DH_TOKEN% | "%DOCKER_EXE%" login -u "%DH_USER%" --password-stdin
-                        "%DOCKER_EXE%" push "%IMAGE_NAME%"
-                        "%DOCKER_EXE%" logout
-                    '''
-                }
-            }
+    steps {
+        withCredentials([
+            usernamePassword(
+                credentialsId: 'dockerhub-creds',
+                usernameVariable: 'DH_USER',
+                passwordVariable: 'DH_TOKEN'
+            )
+        ]) {
+            bat '''
+                @echo off
+                "C:\\Users\\tkail\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\docker.exe" logout
+                if errorlevel 1 exit /b 1
+                echo %DH_TOKEN% | "C:\\Users\\tkail\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\docker.exe" login -u "%DH_USER%" --password-stdin
+                if errorlevel 1 exit /b 1
+                "C:\\Users\\tkail\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\docker.exe" push "24mis0218/order-system:v1"
+                if errorlevel 1 exit /b 1
+                "C:\\Users\\tkail\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\docker.exe" logout
+            '''
         }
+    }
+}
 
         stage('Deploy V1 to Kubernetes') {
             steps {
