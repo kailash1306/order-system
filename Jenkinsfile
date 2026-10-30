@@ -12,7 +12,7 @@ pipeline {
         KUBECTL_EXE = 'C:\\Users\\tkail\\AppData\\Local\\Programs\\DockerDesktop\\resources\\bin\\kubectl.exe'
         KUBECONFIG = 'C:\\jenkins-kube\\config'
 
-        IMAGE_NAME = '24mis0218/order-system:v1'
+        IMAGE_NAME = 'kailash187/order-system:v1'
         DEPLOYMENT_NAME = 'order-v1'
         CONTAINER_NAME = 'order-system'
     }
